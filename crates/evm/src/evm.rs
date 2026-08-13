@@ -348,7 +348,7 @@ where
 mod tests {
     use crate::test_utils::{test_evm, test_evm_with_basefee};
     use alloy_primitives::{B256, U256, keccak256};
-    use alloy_sol_types::{SolCall, SolValue};
+    use alloy_sol_types::{SolCall, SolError, SolValue};
     use indexmap::IndexMap;
     use revm::{
         DatabaseCommit, DatabaseRef,
@@ -394,15 +394,54 @@ mod tests {
             None,
             Sequencer,
             Account,
-            CallbackGateway
+            CallbackGateway,
+            PauseGuardian
+        }
+
+        enum TestZonePortalCapability {
+            PausePortal,
+            AccessPolicy
+        }
+
+        struct TestBlockTransition {
+            bytes32 prevBlockHash;
+            bytes32 nextBlockHash;
+        }
+
+        struct TestDepositQueueTransition {
+            bytes32 prevProcessedHash;
+            bytes32 nextProcessedHash;
+            uint64 prevDepositNumber;
+            uint64 nextDepositNumber;
         }
 
         interface TestZonePortal {
+            error InvalidProof();
+
             function enableToken(address token) external;
             function tokenEnablementHash() external view returns (bytes32);
             function hasRole(address account, TestZonePortalRole role) external view returns (bool);
             function isSequencer(address account) external view returns (bool);
             function setAllowedAccount(address account, bool allowed) external;
+            function paused() external view returns (bool);
+            function pauseExpiry() external view returns (uint64);
+            function abdicationEffectiveAt(TestZonePortalCapability capability)
+                external
+                view
+                returns (uint64);
+            function pause() external;
+            function resume() external;
+            function submitBatch(
+                uint64 tempoBlockNumber,
+                uint64 recentTempoBlockNumber,
+                TestBlockTransition calldata blockTransition,
+                TestDepositQueueTransition calldata depositQueueTransition,
+                bytes32 withdrawalQueueHash,
+                bytes calldata verifierConfig,
+                bytes calldata proof,
+                uint256 nextZoneHeight,
+                bytes[] calldata signatures
+            ) external;
         }
 
         interface TestZoneMessenger {
@@ -817,6 +856,105 @@ mod tests {
             result => panic!("hasRole failed: {result:?}"),
         };
         assert!(TestZonePortal::hasRoleCall::abi_decode_returns(&output).unwrap());
+
+        for call in [
+            TestZonePortal::pausedCall {}.abi_encode(),
+            TestZonePortal::pauseExpiryCall {}.abi_encode(),
+            TestZonePortal::abdicationEffectiveAtCall {
+                capability: TestZonePortalCapability::PausePortal,
+            }
+            .abi_encode(),
+        ] {
+            let result = evm
+                .transact_system_call(Address::ZERO, created.portal, call.into())
+                .unwrap();
+            let output = match result.result {
+                ExecutionResult::Success {
+                    output: revm::context::result::Output::Call(output),
+                    ..
+                } => output,
+                result => panic!("pause ABI call failed: {result:?}"),
+            };
+            assert_eq!(U256::from_be_slice(&output), U256::ZERO);
+        }
+
+        let pause = evm
+            .transact_system_call(
+                sequencer,
+                created.portal,
+                TestZonePortal::pauseCall {}.abi_encode().into(),
+            )
+            .unwrap();
+        assert!(
+            pause.result.is_success(),
+            "pause failed: {:?}",
+            pause.result
+        );
+        evm.db_mut().commit(pause.state);
+
+        let submit = evm
+            .transact_system_call(
+                sequencer,
+                created.portal,
+                TestZonePortal::submitBatchCall {
+                    tempoBlockNumber: 0,
+                    recentTempoBlockNumber: 0,
+                    blockTransition: TestBlockTransition {
+                        prevBlockHash: B256::repeat_byte(1),
+                        nextBlockHash: B256::ZERO,
+                    },
+                    depositQueueTransition: TestDepositQueueTransition {
+                        prevProcessedHash: B256::ZERO,
+                        nextProcessedHash: B256::ZERO,
+                        prevDepositNumber: 0,
+                        nextDepositNumber: 0,
+                    },
+                    withdrawalQueueHash: B256::ZERO,
+                    verifierConfig: Bytes::new(),
+                    proof: Bytes::new(),
+                    nextZoneHeight: U256::ZERO,
+                    signatures: Vec::new(),
+                }
+                .abi_encode()
+                .into(),
+            )
+            .unwrap();
+        match submit.result {
+            ExecutionResult::Revert { output, .. } => {
+                assert_eq!(output.as_ref(), TestZonePortal::InvalidProof::SELECTOR)
+            }
+            result => panic!("paused submitBatch should reach proof validation: {result:?}"),
+        }
+
+        let resume = evm
+            .transact_system_call(
+                admin,
+                created.portal,
+                TestZonePortal::resumeCall {}.abi_encode().into(),
+            )
+            .unwrap();
+        assert!(
+            resume.result.is_success(),
+            "resume failed: {:?}",
+            resume.result
+        );
+        evm.db_mut().commit(resume.state);
+
+        let paused = evm
+            .transact_system_call(
+                Address::ZERO,
+                created.portal,
+                TestZonePortal::pausedCall {}.abi_encode().into(),
+            )
+            .unwrap();
+        let output = match paused.result {
+            ExecutionResult::Success {
+                output: revm::context::result::Output::Call(output),
+                ..
+            } => output,
+            result => panic!("paused failed after resume: {result:?}"),
+        };
+        assert_eq!(U256::from_be_slice(&output), U256::ZERO);
 
         let enable = evm
             .transact_system_call(
