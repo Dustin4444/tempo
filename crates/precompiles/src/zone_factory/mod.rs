@@ -118,7 +118,11 @@ impl ZoneFactory {
         {
             return Err(ZoneFactoryError::token_transfer_policy_not_set().into());
         }
-        validate_closed_loop_config(&call.params.allowedAccounts, &call.params.zoneGateways)?;
+        validate_closed_loop_config(
+            &call.params.allowedAccounts,
+            &call.params.zoneGateways,
+            &call.params.sequencers,
+        )?;
         if call.params.admin.is_zero() {
             return Err(ZoneFactoryError::invalid_admin().into());
         }
@@ -282,11 +286,15 @@ fn validate_token_metadata(name: &str, symbol: &str, currency: &str) -> Result<(
 fn validate_closed_loop_config(
     allowed_accounts: &[Address],
     zone_gateways: &[Address],
+    sequencers: &[Address],
 ) -> Result<()> {
     if allowed_accounts.contains(&ZONE_MESSENGER_ADDRESS)
         || zone_gateways
             .iter()
             .any(|gateway| allowed_accounts.contains(gateway))
+        || sequencers.iter().any(|sequencer| {
+            allowed_accounts.contains(sequencer) || zone_gateways.contains(sequencer)
+        })
     {
         return Err(ZoneFactoryError::invalid_closed_loop_config().into());
     }
@@ -438,15 +446,21 @@ mod tests {
             assert_eq!(portal.sequencer_set_version.read()?, 0);
             assert_eq!(portal.sequencer_threshold.read()?, 2);
             assert_eq!(portal.sequencers.read()?, vec![SEQUENCER_A, SEQUENCER_B]);
-            assert!(portal.is_sequencer[SEQUENCER_A].read()?);
-            assert!(portal.is_sequencer[SEQUENCER_B].read()?);
+            assert_eq!(
+                portal.role[SEQUENCER_A].read()?,
+                u8::from(ZonePortalRole::Sequencer)
+            );
+            assert_eq!(
+                portal.role[SEQUENCER_B].read()?,
+                u8::from(ZonePortalRole::Sequencer)
+            );
             assert_eq!(
                 portal.role[ALLOWED_ACCOUNT].read()?,
-                ZonePortalRole::Account as u8
+                u8::from(ZonePortalRole::Account)
             );
             assert_eq!(
                 portal.role[ZONE_GATEWAY].read()?,
-                ZonePortalRole::CallbackGateway as u8
+                u8::from(ZonePortalRole::CallbackGateway)
             );
             assert!(portal.is_access_enforced.read()?);
             assert!(portal.is_gateway_enforced.read()?);
@@ -473,17 +487,21 @@ mod tests {
                 StorageCtx.sload(created.portal, U256::from(18))?,
                 U256::from(2)
             );
+            assert_eq!(
+                StorageCtx.sload(created.portal, U256::from(19))?,
+                U256::ZERO
+            );
             let membership_slot =
-                U256::from_be_bytes(keccak256((SEQUENCER_A, U256::from(19)).abi_encode()).0);
+                U256::from_be_bytes(keccak256((SEQUENCER_A, U256::from(20)).abi_encode()).0);
             assert_eq!(
                 StorageCtx.sload(created.portal, membership_slot)?,
-                U256::ONE
+                U256::from(u8::from(ZonePortalRole::Sequencer))
             );
             let role_slot =
                 U256::from_be_bytes(keccak256((ALLOWED_ACCOUNT, U256::from(20)).abi_encode()).0);
             assert_eq!(
                 StorageCtx.sload(created.portal, role_slot)?,
-                U256::from(ZonePortalRole::Account as u8)
+                U256::from(u8::from(ZonePortalRole::Account))
             );
             assert_eq!(
                 StorageCtx.sload(created.portal, U256::from(21))?,
@@ -653,6 +671,8 @@ mod tests {
             for (allowed_accounts, zone_gateways) in [
                 (vec![ZONE_MESSENGER_ADDRESS], vec![ZONE_GATEWAY]),
                 (vec![ALLOWED_ACCOUNT], vec![ALLOWED_ACCOUNT]),
+                (vec![SEQUENCER_A], vec![ZONE_GATEWAY]),
+                (vec![ALLOWED_ACCOUNT], vec![SEQUENCER_A]),
             ] {
                 let mut params = create_params(PATH_USD_ADDRESS);
                 params.allowedAccounts = allowed_accounts;
@@ -702,6 +722,31 @@ mod tests {
             params.sequencers = vec![SEQUENCER_B, SEQUENCER_A];
             factory.create_zone(OWNER, IZoneFactory::createZoneCall { params })?;
             assert_eq!(factory.zone(1)?.sequencers, vec![SEQUENCER_B, SEQUENCER_A]);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn create_zone_allows_admin_as_sequencer() -> eyre::Result<()> {
+        let mut storage = HashMapStorageProvider::new_with_spec(1, TempoHardfork::T10);
+        StorageCtx::enter(&mut storage, || -> eyre::Result<()> {
+            TIP20Setup::path_usd(ADMIN).apply()?;
+            let mut factory = factory_with_owner(OWNER)?;
+            let mut params = create_params(PATH_USD_ADDRESS);
+            params.sequencers = vec![ADMIN];
+            params.threshold = 1;
+
+            let created = factory.create_zone(OWNER, IZoneFactory::createZoneCall { params })?;
+
+            assert_eq!(factory.zone(created.zoneId)?.admin, ADMIN);
+            assert_eq!(factory.zone(created.zoneId)?.sequencers, vec![ADMIN]);
+            let portal = ZonePortalStorage::new(created.portal);
+            assert_eq!(portal.admin.read()?, ADMIN);
+            assert_eq!(portal.sequencers.read()?, vec![ADMIN]);
+            assert_eq!(
+                portal.role[ADMIN].read()?,
+                u8::from(ZonePortalRole::Sequencer)
+            );
             Ok(())
         })
     }
