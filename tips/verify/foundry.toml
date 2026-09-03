@@ -17,8 +17,6 @@ remappings = [
 via-ir = true
 optimizer = true
 invariant = { runs = 10, depth = 50, fail_on_revert = true, show_solidity = true }
-# These suites exercise the direct authorization selectors removed in T11.
-no_match_contract = "^AccountKeychain(Test|InvariantTest)$"
 
 [profile.next]
 hardfork = "tempo:T12"
