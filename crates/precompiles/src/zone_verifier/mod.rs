@@ -8,9 +8,10 @@ use alloy::{
     sol_types::SolStruct,
 };
 use tempo_contracts::precompiles::{IZoneVerifier, NitroBatchAttestation, ZONE_VERIFIER_ADDRESS};
+use tempo_nitro_attestation::AWS_NITRO_ROOT_DER;
 use tempo_precompiles_macros::contract;
 
-use self::attestation::{AWS_NITRO_ROOT_DER, verify_attestation_with_root};
+use self::attestation::verify_attestation_with_root;
 use crate::{error::Result, zone_factory::portal_address};
 
 const CONFIG_V1: &[u8] = &[1];
